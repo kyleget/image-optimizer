@@ -1,0 +1,21 @@
+[package]
+name = "image-optimizer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[[bin]]
+name = "image-optimizer"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.47", features = ["derive"] }
+oxipng = { version = "10.2.1", default-features = false }
+png = "0.18.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sha2 = "0.10.9"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.21.0"

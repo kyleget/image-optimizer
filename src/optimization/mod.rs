@@ -14,7 +14,7 @@ const MANIFEST_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct InspectRequest {
     pub input: PathBuf,
-    pub candidate_dir: PathBuf,
+    pub candidate_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +98,11 @@ pub fn inspect(request: InspectRequest) -> Result<InspectReport, InspectError> {
     let source_bytes = fs::read(&source)?;
     let optimized = png::optimize_losslessly(&source_bytes)?;
     let session_id = Uuid::new_v4().to_string();
-    let session_dir = request.candidate_dir.join(&session_id);
+    let candidate_dir = match request.candidate_dir {
+        Some(candidate_dir) => candidate_dir,
+        None => default_candidate_dir()?,
+    };
+    let session_dir = candidate_dir.join(&session_id);
     fs::create_dir_all(&session_dir)?;
 
     let is_candidate = optimized.bytes.len() < source_bytes.len();
@@ -174,6 +178,44 @@ pub fn inspect(request: InspectRequest) -> Result<InspectReport, InspectError> {
     };
     persist_manifest(&session_dir, &report)?;
     Ok(report)
+}
+
+#[cfg(target_os = "macos")]
+fn default_candidate_dir() -> Result<PathBuf, InspectError> {
+    Ok(home_dir()?.join("Library/Caches/image-optimizer"))
+}
+
+#[cfg(target_os = "linux")]
+fn default_candidate_dir() -> Result<PathBuf, InspectError> {
+    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let cache_home = match xdg_cache_home {
+        Some(cache_home) => cache_home,
+        None => home_dir()?.join(".cache"),
+    };
+    Ok(cache_home.join("image-optimizer"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn default_candidate_dir() -> Result<PathBuf, InspectError> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "default candidate storage is supported only on macOS and Linux",
+    )
+    .into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn home_dir() -> Result<PathBuf, InspectError> {
+    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "HOME is not set; use --candidate-dir to select candidate storage",
+        )
+        .into()
+    })
 }
 
 fn persist_manifest(session_dir: &Path, report: &InspectReport) -> Result<(), InspectError> {

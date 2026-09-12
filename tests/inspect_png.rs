@@ -103,6 +103,74 @@ fn inspect_valid_png_by_content_retains_a_complete_immutable_candidate() {
 }
 
 #[test]
+fn inspect_without_candidate_directory_uses_the_per_user_cache() {
+    let temp = TempDir::new().unwrap();
+    let isolated_home = temp.path().join("home");
+    let isolated_xdg_cache = temp.path().join("xdg-cache");
+    let source = temp.path().join("source.png");
+    fs::create_dir(&isolated_home).unwrap();
+    fs::write(&source, fixture_png()).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_image-optimizer"));
+    command.arg("inspect").arg(&source);
+    if cfg!(target_os = "macos") {
+        command
+            .env("HOME", &isolated_home)
+            .env("XDG_CACHE_HOME", &isolated_xdg_cache);
+    } else {
+        command
+            .env_remove("HOME")
+            .env("XDG_CACHE_HOME", &isolated_xdg_cache);
+    }
+    let output = command.output().unwrap();
+
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert!(output.stderr.is_empty(), "unexpected diagnostic output");
+    let report = one_json_document(&output.stdout);
+    let session_id = report["session_id"].as_str().unwrap();
+    let cache_root = if cfg!(target_os = "macos") {
+        isolated_home.join("Library/Caches/image-optimizer")
+    } else if cfg!(target_os = "linux") {
+        isolated_xdg_cache.join("image-optimizer")
+    } else {
+        panic!("default candidate storage is only specified for macOS and Linux");
+    };
+    let session_dir = cache_root.join(session_id);
+    assert!(session_dir.join("manifest.json").is_file());
+    let candidate_id = report["items"][0]["candidate_id"].as_str().unwrap();
+    assert!(session_dir.join(format!("{candidate_id}.png")).is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inspect_without_xdg_cache_uses_the_linux_home_cache() {
+    let temp = TempDir::new().unwrap();
+    let isolated_home = temp.path().join("home");
+    let source = temp.path().join("source.png");
+    fs::create_dir(&isolated_home).unwrap();
+    fs::write(&source, fixture_png()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_image-optimizer"))
+        .arg("inspect")
+        .arg(&source)
+        .env("HOME", &isolated_home)
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert!(output.stderr.is_empty(), "unexpected diagnostic output");
+    let report = one_json_document(&output.stdout);
+    let session_id = report["session_id"].as_str().unwrap();
+    let session_dir = isolated_home
+        .join(".cache/image-optimizer")
+        .join(session_id);
+    assert!(session_dir.join("manifest.json").is_file());
+    let candidate_id = report["items"][0]["candidate_id"].as_str().unwrap();
+    assert!(session_dir.join(format!("{candidate_id}.png")).is_file());
+}
+
+#[test]
 fn inspect_valid_png_without_strict_savings_retains_no_candidate_image() {
     let temp = TempDir::new().unwrap();
     let initial_source = temp.path().join("initial.png");

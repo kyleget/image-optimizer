@@ -16,7 +16,7 @@ enum Command {
     Inspect {
         input: PathBuf,
         #[arg(long)]
-        candidate_dir: PathBuf,
+        candidate_dir: Option<PathBuf>,
     },
 }
 

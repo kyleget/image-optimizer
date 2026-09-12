@@ -4,6 +4,10 @@ use std::io::Cursor;
 use oxipng::{Options, StripChunks};
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+// PNG's largest decoded pixel is 16-bit RGBA. Its filtered stream adds one
+// filter byte per row, whose worst case is one row per allowed pixel.
+const MAX_BYTES_PER_PIXEL: u64 = 8;
+const MAX_FILTER_BYTES_PER_PIXEL: u64 = 1;
 
 pub(super) struct OptimizedPng {
     pub(super) bytes: Vec<u8>,
@@ -12,26 +16,19 @@ pub(super) struct OptimizedPng {
     pub(super) present_metadata_classes: Vec<&'static str>,
 }
 
-pub(super) fn optimize_losslessly(input: &[u8]) -> Result<OptimizedPng, PngOptimizationError> {
-    if !input.starts_with(PNG_SIGNATURE) {
-        return Err(PngOptimizationError::NotPng);
-    }
+pub(super) fn optimize_losslessly(
+    input: &[u8],
+    max_decoded_pixels: u64,
+) -> Result<OptimizedPng, PngOptimizationError> {
+    validate_header_and_pixel_limit(input, max_decoded_pixels)?;
 
-    let original = decode(input)?;
+    let original = decode(input, max_decoded_pixels)?;
     let original_chunks = chunks_except_image_data(input)?;
-    let mut options = Options::from_preset(3);
-    options.interlace = None;
-    options.optimize_alpha = false;
-    options.bit_depth_reduction = false;
-    options.color_type_reduction = false;
-    options.palette_reduction = false;
-    options.grayscale_reduction = false;
-    options.scale_16 = false;
-    options.strip = StripChunks::None;
+    let options = lossless_options(max_decoded_pixels);
     let candidate = oxipng::optimize_from_memory(input, &options)
         .map_err(|error| PngOptimizationError::Codec(error.to_string()))?;
 
-    let optimized = decode(&candidate)?;
+    let optimized = decode(&candidate, max_decoded_pixels)?;
     if original != optimized {
         return Err(PngOptimizationError::Preservation(
             "decoded pixels, transparency, or image properties changed",
@@ -51,6 +48,70 @@ pub(super) fn optimize_losslessly(input: &[u8]) -> Result<OptimizedPng, PngOptim
     })
 }
 
+fn lossless_options(max_decoded_pixels: u64) -> Options {
+    let mut options = Options::from_preset(3);
+    options.interlace = None;
+    options.optimize_alpha = false;
+    options.bit_depth_reduction = false;
+    options.color_type_reduction = false;
+    options.palette_reduction = false;
+    options.grayscale_reduction = false;
+    options.scale_16 = false;
+    options.strip = StripChunks::None;
+    options.max_decompressed_size = Some(max_decompressed_size(max_decoded_pixels));
+    options
+}
+
+fn decoded_output_limit(max_decoded_pixels: u64) -> usize {
+    usize_limit(max_decoded_pixels.saturating_mul(MAX_BYTES_PER_PIXEL))
+}
+
+fn max_decompressed_size(max_decoded_pixels: u64) -> usize {
+    usize_limit(max_decoded_pixels.saturating_mul(MAX_BYTES_PER_PIXEL + MAX_FILTER_BYTES_PER_PIXEL))
+}
+
+fn decoder_limits(max_decoded_pixels: u64) -> png::Limits {
+    png::Limits {
+        bytes: max_decompressed_size(max_decoded_pixels),
+    }
+}
+
+fn usize_limit(limit: u64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+fn validate_header_and_pixel_limit(
+    input: &[u8],
+    max_decoded_pixels: u64,
+) -> Result<(), PngOptimizationError> {
+    if !input.starts_with(PNG_SIGNATURE) {
+        return Err(PngOptimizationError::NotPng);
+    }
+    if input.len() < 33 || &input[12..16] != b"IHDR" {
+        return Err(PngOptimizationError::Codec(
+            "missing or truncated IHDR chunk".to_owned(),
+        ));
+    }
+    let ihdr_length = u32::from_be_bytes(input[8..12].try_into().expect("length was checked"));
+    if ihdr_length != 13 {
+        return Err(PngOptimizationError::Codec(
+            "invalid IHDR chunk length".to_owned(),
+        ));
+    }
+    let width = u32::from_be_bytes(input[16..20].try_into().expect("length was checked"));
+    let height = u32::from_be_bytes(input[20..24].try_into().expect("length was checked"));
+    if width == 0 || height == 0 {
+        return Err(PngOptimizationError::Codec(
+            "PNG dimensions must be nonzero".to_owned(),
+        ));
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > max_decoded_pixels {
+        return Err(PngOptimizationError::PixelLimitExceeded);
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DecodedPng {
     width: u32,
@@ -60,17 +121,19 @@ struct DecodedPng {
     pixels: Vec<u8>,
 }
 
-fn decode(bytes: &[u8]) -> Result<DecodedPng, PngOptimizationError> {
-    let decoder = png::Decoder::new(Cursor::new(bytes));
+fn decode(bytes: &[u8], max_decoded_pixels: u64) -> Result<DecodedPng, PngOptimizationError> {
+    let decoder =
+        png::Decoder::new_with_limits(Cursor::new(bytes), decoder_limits(max_decoded_pixels));
     let mut reader = decoder
         .read_info()
         .map_err(|error| PngOptimizationError::Codec(error.to_string()))?;
-    let mut pixels = vec![
-        0;
-        reader.output_buffer_size().ok_or_else(|| {
-            PngOptimizationError::Codec("decoded image exceeds addressable memory".into())
-        })?
-    ];
+    let output_buffer_size = reader.output_buffer_size().ok_or_else(|| {
+        PngOptimizationError::Codec("decoded image exceeds addressable memory".into())
+    })?;
+    if output_buffer_size > decoded_output_limit(max_decoded_pixels) {
+        return Err(PngOptimizationError::PixelLimitExceeded);
+    }
+    let mut pixels = vec![0; output_buffer_size];
     let output = reader
         .next_frame(&mut pixels)
         .map_err(|error| PngOptimizationError::Codec(error.to_string()))?;
@@ -149,7 +212,22 @@ fn metadata_classes(chunks: &[Chunk]) -> Vec<&'static str> {
 pub(super) enum PngOptimizationError {
     NotPng,
     Codec(String),
+    PixelLimitExceeded,
     Preservation(&'static str),
+}
+
+impl PngOptimizationError {
+    pub(super) fn reason_code(&self) -> &'static str {
+        match self {
+            Self::PixelLimitExceeded => "decoded_pixel_limit_exceeded",
+            Self::Preservation(_) => "preservation_validation_failed",
+            Self::NotPng | Self::Codec(_) => "malformed_png",
+        }
+    }
+
+    pub(super) fn recognized_as_png(&self) -> bool {
+        !matches!(self, Self::NotPng)
+    }
 }
 
 impl std::fmt::Display for PngOptimizationError {
@@ -157,6 +235,7 @@ impl std::fmt::Display for PngOptimizationError {
         match self {
             Self::NotPng => formatter.write_str("input bytes do not have a PNG signature"),
             Self::Codec(error) => formatter.write_str(error),
+            Self::PixelLimitExceeded => formatter.write_str("decoded pixel limit exceeded"),
             Self::Preservation(detail) => {
                 write!(formatter, "preservation validation failed: {detail}")
             }
@@ -165,3 +244,26 @@ impl std::fmt::Display for PngOptimizationError {
 }
 
 impl std::error::Error for PngOptimizationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_BYTES_PER_PIXEL, decoded_output_limit, decoder_limits, lossless_options,
+        max_decompressed_size,
+    };
+
+    #[test]
+    fn codec_budgets_are_derived_from_the_decoded_pixel_limit() {
+        let pixel_limit = 100_000_000;
+        let decoded_limit = pixel_limit * MAX_BYTES_PER_PIXEL;
+        let scanline_limit = decoded_limit + pixel_limit;
+
+        assert_eq!(decoded_output_limit(pixel_limit), decoded_limit as usize);
+        assert_eq!(max_decompressed_size(pixel_limit), scanline_limit as usize);
+        assert_eq!(decoder_limits(pixel_limit).bytes, scanline_limit as usize);
+        assert_eq!(
+            lossless_options(pixel_limit).max_decompressed_size,
+            Some(scanline_limit as usize)
+        );
+    }
+}

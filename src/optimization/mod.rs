@@ -1,15 +1,18 @@
 mod png;
+mod report;
+mod storage;
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use report::InspectItem;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
-const MANIFEST_VERSION: u32 = 1;
+pub use report::InspectReport;
+
+const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DECODED_PIXELS: u64 = 100_000_000;
 
 #[derive(Debug)]
 pub struct InspectRequest {
@@ -17,264 +20,142 @@ pub struct InspectRequest {
     pub candidate_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct InspectReport {
-    schema_version: u32,
-    command: &'static str,
-    session_id: String,
-    summary: Summary,
-    items: Vec<InspectItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct Manifest<'a> {
-    manifest_version: u32,
-    session_id: &'a str,
-    items: &'a [InspectItem],
-}
-
-#[derive(Debug, Serialize)]
-struct Summary {
-    candidate: u32,
-    unchanged: u32,
-    skipped: u32,
-    failed: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct InspectItem {
-    outcome: Outcome,
-    reason_code: &'static str,
-    source: String,
-    destination: String,
-    format: &'static str,
-    source_hash: String,
-    destination_hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    candidate_hash: Option<String>,
-    original_bytes: u64,
-    candidate_bytes: u64,
-    original_dimensions: Dimensions,
-    candidate_dimensions: Dimensions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    savings_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    savings_percent: Option<f64>,
-    resolved_policy: ResolvedPolicy,
-    metadata_policy: MetadataPolicy,
-    operations: [&'static str; 1],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    candidate_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Outcome {
-    Candidate,
-    Unchanged,
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-struct Dimensions {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct ResolvedPolicy {
-    preset: &'static str,
-    policy_id: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct MetadataPolicy {
-    mode: &'static str,
-    supported_classes: [&'static str; 5],
-    present_classes: Vec<&'static str>,
-}
-
-pub fn inspect(request: InspectRequest) -> Result<InspectReport, InspectError> {
-    let source = fs::canonicalize(&request.input)?;
-    let source_bytes = fs::read(&source)?;
-    let optimized = png::optimize_losslessly(&source_bytes)?;
+pub fn inspect(request: InspectRequest) -> InspectReport {
     let session_id = Uuid::new_v4().to_string();
+    let source = match fs::canonicalize(&request.input) {
+        Ok(source) => source,
+        Err(error) => {
+            let (reason_code, diagnostic) = source_error(&error);
+            return InspectReport::failed(
+                session_id,
+                InspectItem::failure(reason_code),
+                diagnostic,
+            );
+        }
+    };
+    let identity = source.to_string_lossy().into_owned();
+    let source_bytes = match read_source_bounded(&source) {
+        Ok(bytes) => bytes,
+        Err(SourceReadError::TooLarge) => {
+            return InspectReport::failed(
+                session_id,
+                InspectItem::input_failure("input_byte_limit_exceeded", identity),
+                "source exceeds the 512 MiB per-file input limit".to_owned(),
+            );
+        }
+        Err(SourceReadError::Unreadable(error)) => {
+            let (reason_code, diagnostic) = source_error(&error);
+            return InspectReport::failed(
+                session_id,
+                InspectItem::input_failure(reason_code, identity),
+                diagnostic,
+            );
+        }
+    };
+    let optimized = match png::optimize_losslessly(&source_bytes, MAX_DECODED_PIXELS) {
+        Ok(optimized) => optimized,
+        Err(error) => {
+            let reason_code = error.reason_code();
+            let item = InspectItem::png_failure(
+                reason_code,
+                identity,
+                &source_bytes,
+                error.recognized_as_png(),
+            );
+            let diagnostic = match reason_code {
+                "decoded_pixel_limit_exceeded" => {
+                    "PNG exceeds the 100 million pixels per-file decoded limit".to_owned()
+                }
+                "preservation_validation_failed" => {
+                    format!("PNG preservation validation failed: {error}")
+                }
+                _ => format!("malformed PNG: {error}"),
+            };
+            return InspectReport::failed(session_id, item, diagnostic);
+        }
+    };
+
     let candidate_dir = match request.candidate_dir {
         Some(candidate_dir) => candidate_dir,
-        None => default_candidate_dir()?,
+        None => match storage::default_candidate_dir() {
+            Ok(candidate_dir) => candidate_dir,
+            Err(error) => {
+                let item = InspectItem::completed(&identity, &source_bytes, &optimized, None);
+                return InspectReport::storage_failure(session_id, item, error);
+            }
+        },
     };
     let session_dir = candidate_dir.join(&session_id);
-    fs::create_dir_all(&session_dir)?;
-
     let is_candidate = optimized.bytes.len() < source_bytes.len();
     let candidate_id = is_candidate.then(|| Uuid::new_v4().to_string());
+    let item = InspectItem::completed(&identity, &source_bytes, &optimized, candidate_id.clone());
+
+    if let Err(error) = storage::create_session_dir(&session_dir) {
+        return InspectReport::storage_failure(session_id, item, error);
+    }
     if let Some(candidate_id) = candidate_id.as_deref() {
         let candidate_path = session_dir.join(format!("{candidate_id}.png"));
-        create_immutable_file(&candidate_path, &optimized.bytes)?;
+        if let Err(error) = storage::store_candidate(&candidate_path, &optimized.bytes) {
+            storage::clean_failed_session(&session_dir, Some(candidate_id));
+            return InspectReport::storage_failure(session_id, item, error);
+        }
     }
 
-    let original_bytes = u64::try_from(source_bytes.len()).expect("usize fits into u64");
-    let candidate_bytes = u64::try_from(optimized.bytes.len()).expect("usize fits into u64");
-    let savings_bytes = is_candidate.then_some(original_bytes - candidate_bytes);
-    let savings_percent = savings_bytes.map(|saved| saved as f64 * 100.0 / original_bytes as f64);
-    let identity = source.to_string_lossy().into_owned();
-    let item = InspectItem {
-        outcome: if is_candidate {
-            Outcome::Candidate
-        } else {
-            Outcome::Unchanged
-        },
-        reason_code: if is_candidate {
-            "smaller_lossless_candidate"
-        } else {
-            "not_strictly_smaller"
-        },
-        source: identity.clone(),
-        destination: identity,
-        format: "png",
-        source_hash: sha256(&source_bytes),
-        destination_hash: sha256(&source_bytes),
-        candidate_hash: is_candidate.then(|| sha256(&optimized.bytes)),
-        original_bytes,
-        candidate_bytes,
-        original_dimensions: Dimensions {
-            width: optimized.width,
-            height: optimized.height,
-        },
-        candidate_dimensions: Dimensions {
-            width: optimized.width,
-            height: optimized.height,
-        },
-        savings_bytes,
-        savings_percent,
-        resolved_policy: ResolvedPolicy {
-            preset: "lossless",
-            policy_id: "png-lossless-v1",
-        },
-        metadata_policy: MetadataPolicy {
-            mode: "preserve",
-            supported_classes: [
-                "color_appearance",
-                "exif",
-                "physical_dimensions",
-                "text",
-                "unknown_ancillary",
-            ],
-            present_classes: optimized.present_metadata_classes,
-        },
-        operations: ["lossless_compression"],
-        candidate_id,
+    let report = InspectReport::successful(session_id, item, is_candidate);
+    let manifest = match report.manifest_bytes() {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            storage::clean_failed_session(&session_dir, candidate_id.as_deref());
+            return report.into_storage_failure(error);
+        }
     };
-    let report = InspectReport {
-        schema_version: SCHEMA_VERSION,
-        command: "inspect",
-        session_id,
-        summary: Summary {
-            candidate: u32::from(is_candidate),
-            unchanged: u32::from(!is_candidate),
-            skipped: 0,
-            failed: 0,
-        },
-        items: vec![item],
-    };
-    persist_manifest(&session_dir, &report)?;
-    Ok(report)
+    if let Err(error) = storage::persist_manifest(&session_dir, &manifest) {
+        storage::clean_failed_session(&session_dir, candidate_id.as_deref());
+        return report.into_storage_failure(error);
+    }
+    report
 }
 
-#[cfg(target_os = "macos")]
-fn default_candidate_dir() -> Result<PathBuf, InspectError> {
-    Ok(home_dir()?.join("Library/Caches/image-optimizer"))
+pub fn invalid_invocation_report() -> InspectReport {
+    InspectReport::invalid_invocation()
 }
 
-#[cfg(target_os = "linux")]
-fn default_candidate_dir() -> Result<PathBuf, InspectError> {
-    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute());
-    let cache_home = match xdg_cache_home {
-        Some(cache_home) => cache_home,
-        None => home_dir()?.join(".cache"),
-    };
-    Ok(cache_home.join("image-optimizer"))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn default_candidate_dir() -> Result<PathBuf, InspectError> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "default candidate storage is supported only on macOS and Linux",
-    )
-    .into())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn home_dir() -> Result<PathBuf, InspectError> {
-    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME is not set; use --candidate-dir to select candidate storage",
+fn source_error(error: &io::Error) -> (&'static str, String) {
+    if error.kind() == io::ErrorKind::NotFound {
+        ("source_not_found", "source does not exist".to_owned())
+    } else {
+        (
+            "source_unreadable",
+            format!("source could not be read: {error}"),
         )
-        .into()
-    })
-}
-
-fn persist_manifest(session_dir: &Path, report: &InspectReport) -> Result<(), InspectError> {
-    let manifest = Manifest {
-        manifest_version: MANIFEST_VERSION,
-        session_id: &report.session_id,
-        items: &report.items,
-    };
-    let bytes = serde_json::to_vec_pretty(&manifest)?;
-    create_immutable_file(&session_dir.join("manifest.json"), &bytes)
-}
-
-fn create_immutable_file(path: &Path, bytes: &[u8]) -> Result<(), InspectError> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    let mut permissions = file.metadata()?.permissions();
-    permissions.set_readonly(true);
-    file.set_permissions(permissions)?;
-    Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-#[derive(Debug)]
-pub struct InspectError {
-    detail: String,
-}
-
-impl std::fmt::Display for InspectError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
     }
 }
 
-impl std::error::Error for InspectError {}
-
-impl From<io::Error> for InspectError {
-    fn from(error: io::Error) -> Self {
-        Self {
-            detail: format!("filesystem error: {error}"),
-        }
-    }
+enum SourceReadError {
+    TooLarge,
+    Unreadable(io::Error),
 }
 
-impl From<png::PngOptimizationError> for InspectError {
-    fn from(error: png::PngOptimizationError) -> Self {
-        Self {
-            detail: format!("PNG optimization failed: {error}"),
-        }
+fn read_source_bounded(path: &Path) -> Result<Vec<u8>, SourceReadError> {
+    let file = fs::File::open(path).map_err(SourceReadError::Unreadable)?;
+    let metadata = file.metadata().map_err(SourceReadError::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(SourceReadError::Unreadable(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input is not a regular file",
+        )));
     }
-}
+    if metadata.len() > MAX_INPUT_BYTES {
+        return Err(SourceReadError::TooLarge);
+    }
 
-impl From<serde_json::Error> for InspectError {
-    fn from(error: serde_json::Error) -> Self {
-        Self {
-            detail: format!("manifest serialization failed: {error}"),
-        }
+    let mut bytes = Vec::new();
+    file.take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(SourceReadError::Unreadable)?;
+    if u64::try_from(bytes.len()).expect("usize fits into u64") > MAX_INPUT_BYTES {
+        Err(SourceReadError::TooLarge)
+    } else {
+        Ok(bytes)
     }
 }

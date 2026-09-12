@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -240,6 +241,204 @@ fn inspect_valid_png_without_strict_savings_retains_no_candidate_image() {
     assert_eq!(manifest["items"], report["items"]);
 }
 
+#[test]
+fn inspect_malformed_png_reports_one_bounded_file_failure() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("broken.png");
+    let candidate_root = temp.path().join("candidates");
+    fs::write(&source, b"\x89PNG\r\n\x1a\nnot-a-valid-png").unwrap();
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("malformed PNG"));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "malformed_png");
+    let item = &report["items"][0];
+    assert_eq!(
+        item["source"],
+        fs::canonicalize(&source).unwrap().to_str().unwrap()
+    );
+    assert_eq!(item["format"], "png");
+    assert!(item.get("candidate_id").is_none());
+    assert!(item.get("candidate_bytes").is_none());
+    assert!(item.get("candidate_hash").is_none());
+    assert!(item.get("candidate_dimensions").is_none());
+    assert!(item.get("savings_bytes").is_none());
+    assert!(item.get("savings_percent").is_none());
+    assert!(!candidate_root.exists());
+}
+
+#[test]
+fn inspect_missing_source_has_a_distinct_stable_failure() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("missing.png");
+    let candidate_root = temp.path().join("candidates");
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("source does not exist"));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "source_not_found");
+    assert_eq!(
+        report["items"][0],
+        json!({
+            "outcome": "failed",
+            "reason_code": "source_not_found"
+        })
+    );
+    assert!(!candidate_root.exists());
+}
+
+#[test]
+fn inspect_unreadable_source_has_a_distinct_stable_failure() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source-directory.png");
+    let candidate_root = temp.path().join("candidates");
+    fs::create_dir(&source).unwrap();
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("source could not be read"));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "source_unreadable");
+    assert!(report["items"][0].get("candidate_id").is_none());
+    assert!(!candidate_root.exists());
+}
+
+#[test]
+fn inspect_candidate_storage_failure_is_a_bounded_file_failure() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.png");
+    let candidate_root = temp.path().join("not-a-directory");
+    fs::write(&source, fixture_png()).unwrap();
+    fs::write(&candidate_root, b"blocks session directory creation").unwrap();
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("candidate storage failed"));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "candidate_storage_failed");
+    let item = &report["items"][0];
+    assert!(item.get("candidate_id").is_none());
+    assert!(item.get("candidate_hash").is_none());
+    assert!(item.get("candidate_bytes").is_none());
+    assert_eq!(
+        fs::read(&candidate_root).unwrap(),
+        b"blocks session directory creation"
+    );
+}
+
+#[test]
+fn inspect_rejects_an_input_over_the_released_per_file_byte_limit() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("oversized.png");
+    let candidate_root = temp.path().join("candidates");
+    let file = File::create(&source).unwrap();
+    file.set_len(512 * 1024 * 1024 + 1).unwrap();
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "input_byte_limit_exceeded");
+    assert!(text(&output.stderr).contains("512 MiB"));
+    assert!(!candidate_root.exists());
+}
+
+#[test]
+fn inspect_rejects_png_dimensions_over_the_released_pixel_limit_before_decoding() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("too-many-pixels.png");
+    let candidate_root = temp.path().join("candidates");
+    fs::write(&source, png_header_with_dimensions(10_001, 10_000)).unwrap();
+
+    let output = inspect(&source, &candidate_root);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = one_json_document(&output.stdout);
+    assert_failed_inspection(&report, "decoded_pixel_limit_exceeded");
+    assert!(text(&output.stderr).contains("100 million pixels"));
+    assert!(report["items"][0].get("candidate_dimensions").is_none());
+    assert!(!candidate_root.exists());
+}
+
+#[test]
+fn invalid_inspect_invocations_emit_one_json_document_and_exit_two() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.png");
+    fs::write(&source, fixture_png()).unwrap();
+    let invocations = [
+        vec!["inspect".into()],
+        vec![
+            "inspect".into(),
+            source.as_os_str().to_owned(),
+            "unexpected-extra-input.png".into(),
+        ],
+        vec![
+            "inspect".into(),
+            source.as_os_str().to_owned(),
+            "--unknown-option".into(),
+        ],
+    ];
+
+    for args in invocations {
+        let output = Command::new(env!("CARGO_BIN_EXE_image-optimizer"))
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!output.stderr.is_empty());
+        let report = one_json_document(&output.stdout);
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["command"], "inspect");
+        assert!(report.get("session_id").is_none());
+        assert_eq!(
+            report["summary"],
+            json!({"candidate": 0, "unchanged": 0, "skipped": 0, "failed": 1})
+        );
+        assert_eq!(
+            report["items"],
+            json!([{
+                "outcome": "failed",
+                "reason_code": "invalid_invocation"
+            }])
+        );
+    }
+}
+
+#[test]
+fn invalid_root_invocations_emit_one_json_document_and_exit_two() {
+    for args in [vec![], vec!["unknown-subcommand"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_image-optimizer"))
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!output.stderr.is_empty());
+        let report = one_json_document(&output.stdout);
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["command"], "inspect");
+        assert!(report.get("session_id").is_none());
+        assert_eq!(
+            report["summary"],
+            json!({"candidate": 0, "unchanged": 0, "skipped": 0, "failed": 1})
+        );
+        assert_eq!(
+            report["items"],
+            json!([{
+                "outcome": "failed",
+                "reason_code": "invalid_invocation"
+            }])
+        );
+    }
+}
+
 fn inspect(source: &Path, candidate_root: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_image-optimizer"))
         .arg("inspect")
@@ -258,6 +457,28 @@ fn one_json_document(stdout: &[u8]) -> Value {
         "stdout contained another JSON document"
     );
     document
+}
+
+fn assert_failed_inspection(report: &Value, reason_code: &str) {
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "inspect");
+    uuid::Uuid::parse_str(report["session_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        report["summary"],
+        json!({"candidate": 0, "unchanged": 0, "skipped": 0, "failed": 1})
+    );
+    assert_eq!(report["items"].as_array().unwrap().len(), 1);
+    assert_eq!(report["items"][0]["outcome"], "failed");
+    assert_eq!(report["items"][0]["reason_code"], reason_code);
+}
+
+fn png_header_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
 }
 
 fn fixture_png() -> Vec<u8> {
